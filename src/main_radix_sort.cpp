@@ -13,6 +13,29 @@
 
 #include <fstream>
 
+// #define PRINT_GPU_ARRAY_ON
+
+void print_gpu_array(const std::string& message, const gpu::gpu_mem_32u& arr, int bits_count = 0)
+{
+#ifndef PRINT_GPU_ARRAY_ON
+    return;
+#endif
+    std::cout << message;
+    auto arr_cpu = arr.readVector();
+    for (size_t i = 0; i < arr_cpu.size(); ++i) {
+        if (bits_count > 0) {
+            unsigned int x = arr_cpu[i];
+            for (int bit = bits_count - 1; bit >= 0; --bit) {
+                std::cout << ((x >> bit) & 1);
+            }
+        } else {
+            std::cout << arr_cpu[i];
+        }
+        std::cout << ((i + 1) % RADIX_BINS == 0 ? '|' : ' ');
+    }
+    std::cout << std::endl;
+}
+
 void run(int argc, char** argv)
 {
     // chooseGPUVkDevices:
@@ -50,7 +73,7 @@ void run(int argc, char** argv)
 
     FastRandom r;
 
-    unsigned int n = 100*1000*1000;
+    unsigned int n = 100 * 1000 * 1000;
     int max_value = std::numeric_limits<int>::max();
     std::vector<unsigned int> as(n, 0);
     std::vector<unsigned int> sorted(n, 0);
@@ -86,46 +109,85 @@ void run(int argc, char** argv)
     }
 
     // Аллоцируем буферы в VRAM
+    gpu::WorkSize work_size(GROUP_SIZE, n);
+    const unsigned int grid_size = work_size.cuGridSize().x;
+
     gpu::gpu_mem_32u input_gpu(n);
-    gpu::gpu_mem_32u mapped_input_gpu(n), prefix_sum_accum_gpu(n), buffer1_pow2_sum_gpu(n), buffer2_pow2_sum_gpu(n);
-    gpu::gpu_mem_32u sort_buffer1(n), sort_buffer2(n);
+
+    gpu::gpu_mem_32u hist_gpu(grid_size * RADIX_BINS);
+    gpu::gpu_mem_32u hist_pref_gpu(grid_size * RADIX_BINS);
+
+    gpu::gpu_mem_32u hist_pref_sum_accum_gpu(grid_size * RADIX_BINS);
+    gpu::gpu_mem_32u hist_pref_pref_gpu(grid_size * RADIX_BINS);
+    gpu::gpu_mem_32u pow2_sum_buffer1_gpu(grid_size * RADIX_BINS);
+    gpu::gpu_mem_32u pow2_sum_buffer2_gpu(grid_size * RADIX_BINS);
+
+    gpu::gpu_mem_32u sort_buffer1_gpu(n);
+    gpu::gpu_mem_32u sort_buffer2_gpu(n);
 
     // Прогружаем входные данные по PCI-E шине: CPU RAM -> GPU VRAM
     input_gpu.writeN(as.data(), n);
+
+    print_gpu_array("initial: ", input_gpu, 5);
 
     // Запускаем кернел (несколько раз и с замером времени выполнения)
     std::vector<double> times;
     for (int iter = 0; iter < 10; ++iter) {
         timer t;
 
-        sort_buffer1.write(input_gpu, n * sizeof(unsigned int));
-        gpu::WorkSize work_size(std::min(256U, n), n);
+        input_gpu.copyToN(sort_buffer1_gpu, input_gpu.number());
 
-        auto &sort_input = sort_buffer1, sort_output = sort_buffer2;
-        for (int i = 0; i < 32; ++i) {
-            cuda::radix_sort_01_local_counting(work_size, sort_input, mapped_input_gpu, n, i);
+        auto &sort_input = sort_buffer1_gpu, sort_output = sort_buffer2_gpu;
+        bool swap_output = true;
+        for (int offset = 0; (1 << offset) <= max_value && offset < 32; offset += RADIX_BITS) {
+            cuda::fill_buffer_with_zeros(work_size, hist_gpu, hist_gpu.number());
+            cuda::radix_sort_01_local_counting(work_size, sort_input, hist_gpu, hist_pref_gpu, n, offset);
 
-            prefix_sum_accum_gpu.write(mapped_input_gpu, n * sizeof(unsigned int));
-            buffer1_pow2_sum_gpu.write(mapped_input_gpu, n * sizeof(unsigned int));
+            print_gpu_array("hist: ", hist_gpu);
+            print_gpu_array("hist_pref in block: ", hist_pref_gpu);
 
-            auto &pow2_sum_in = buffer1_pow2_sum_gpu, &pow2_sum_out = buffer2_pow2_sum_gpu;
-            for (unsigned int pow2 = 0; (1 << pow2) < n; pow2++) {
-                if (pow2 == 0) {
-                    cuda::radix_sort_03_global_prefixes_scan_accumulation(work_size, pow2_sum_in, prefix_sum_accum_gpu, n, pow2);
-                    continue;
+            hist_pref_gpu.copyToN(hist_pref_pref_gpu, hist_gpu.number());
+            hist_pref_gpu.copyToN(pow2_sum_buffer1_gpu, hist_gpu.number());
+
+            auto &pow2_sum_in = pow2_sum_buffer1_gpu, &pow2_sum_out = pow2_sum_buffer2_gpu;
+            for (unsigned int pow2 = 0; (1 << pow2) < grid_size; pow2++) {
+                if (pow2 > 0) {
+                    auto num_blocks = div_ceil<unsigned int>(grid_size, 1 << pow2);
+                    gpu::WorkSize reduction_work_size(GROUP_SIZE, num_blocks * GROUP_SIZE);
+                    cuda::radix_sort_02_global_prefixes_scan_sum_reduction(reduction_work_size, pow2_sum_in, pow2_sum_out);
+                    std::swap(pow2_sum_in, pow2_sum_out);
                 }
-
-                unsigned int n_work_items = div_ceil(n, (1U << (pow2 - 1)));
-                gpu::WorkSize pref_sum_reduction_work_size(std::min(256U, n_work_items), n_work_items);
-                cuda::radix_sort_02_global_prefixes_scan_sum_reduction(pref_sum_reduction_work_size, pow2_sum_in, pow2_sum_out, n_work_items);
-
-                std::swap(pow2_sum_in, pow2_sum_out);
-
-                cuda::radix_sort_03_global_prefixes_scan_accumulation(work_size, pow2_sum_in, prefix_sum_accum_gpu, n, pow2);
+                cuda::radix_sort_03_global_prefixes_scan_accumulation(work_size, pow2_sum_in, hist_pref_pref_gpu, pow2);
             }
 
-            cuda::radix_sort_04_scatter(work_size, sort_input, prefix_sum_accum_gpu, sort_output, n, i);
+            hist_gpu.copyToN(hist_pref_sum_accum_gpu, hist_gpu.number());
+            hist_gpu.copyToN(pow2_sum_buffer1_gpu, hist_gpu.number());
+
+            pow2_sum_in = pow2_sum_buffer1_gpu;
+            pow2_sum_out = pow2_sum_buffer2_gpu;
+            for (unsigned int pow2 = 0; (1 << pow2) < grid_size; pow2++) {
+                if (pow2 > 0) {
+                    auto num_blocks = div_ceil<unsigned int>(grid_size, 1 << pow2);
+                    gpu::WorkSize reduction_work_size(GROUP_SIZE, num_blocks * GROUP_SIZE);
+                    cuda::radix_sort_02_global_prefixes_scan_sum_reduction(reduction_work_size, pow2_sum_in, pow2_sum_out);
+                    std::swap(pow2_sum_in, pow2_sum_out);
+                }
+                cuda::radix_sort_03_global_prefixes_scan_accumulation(work_size, pow2_sum_in, hist_pref_sum_accum_gpu, pow2);
+            }
+
+            print_gpu_array("hist_pref sum: ", hist_pref_sum_accum_gpu);
+
+            print_gpu_array("hist_pref_pref: ", hist_pref_pref_gpu);
+
+            cuda::radix_sort_04_scatter(work_size, sort_input, hist_pref_sum_accum_gpu, hist_pref_pref_gpu, sort_output, n, offset);
             std::swap(sort_input, sort_output);
+            swap_output = !swap_output;
+
+            print_gpu_array("offset " + std::to_string(offset) + ": ", sort_input, 5);
+        }
+
+        if (swap_output) {
+            std::swap(sort_buffer1_gpu, sort_buffer2_gpu);
         }
 
         times.push_back(t.elapsed());
@@ -137,7 +199,7 @@ void run(int argc, char** argv)
     std::cout << "GPU radix-sort median effective VRAM bandwidth: " << memory_size_gb / stats::median(times) << " GB/s (" << n / 1000 / 1000 / stats::median(times) << " uint millions/s)" << std::endl;
 
     // Считываем результат по PCI-E шине: GPU VRAM -> CPU RAM
-    std::vector<unsigned int> gpu_sorted = sort_buffer2.readVector();
+    std::vector<unsigned int> gpu_sorted = sort_buffer2_gpu.readVector();
 
     // Сверяем результат
     for (size_t i = 0; i < n; ++i) {
